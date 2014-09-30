@@ -642,9 +642,13 @@ class FuncPtr():
 
                     # Locate executable segments
                     # NOTE: Each module may have multiple executable segments
+                    # TODO: Search for "MOV REG, PTR # CALL REG"
                     if seg.perm & idaapi.SEGPERM_EXEC:
 
                         # Search all instances of CALL /2 imm32/64 - FF 15
+                        # TODO: Alternative pointer calls using SIB: FF 14 E5 11 22 33 44 - call dword/qword ptr [0x44332211]
+                        #                                            FF 14 65 11 22 33 44
+                        #                                            FF 14 25 11 22 33 44
                         call_ea = seg.startEA
                         while True:
                             call_ea = idaapi.find_binary(call_ea + 1, seg.endEA, "FF 15", 16, idaapi.SEARCH_DOWN)
@@ -652,6 +656,9 @@ class FuncPtr():
                             ptr_calls.append( call_ea )
 
                         # Search all instances of JMP /2 imm32/64 - FF 25
+                        # TODO: Alternative pointer calls using SIB: FF 24 E5 11 22 33 44 - jmp dword/qword ptr [0x44332211]
+                        #                                            FF 24 65 11 22 33 44
+                        #                                            FF 24 25 11 22 33 44
                         call_ea = seg.startEA
                         while True:
                             call_ea = idaapi.find_binary(call_ea + 1, seg.endEA, "FF 25", 16, idaapi.SEARCH_DOWN)
@@ -895,6 +902,14 @@ class Rop():
 
     def __init__(self, sploiter):
         
+        self.maxRopOffset = 40 # Maximum offset from the return instruction to look for gadgets. default: 40
+        self.maxRopSize   = 6  # Maximum number of instructions to look for gadgets. default: 6
+        self.maxRetnImm   = 64 # Maximum imm16 value in retn. default: 64
+        self.maxJopImm    = 255 # Maximum jop [reg + IMM] value. default: 64
+        self.maxRops      = 0  # Maximum number of ROP chains to find. default: 0 (unlimited)
+
+        self.debug        = False
+
         self.regnames     = idaapi.ph_get_regnames()
 
         self.sploiter     = sploiter
@@ -905,8 +920,8 @@ class Rop():
         self.insn_cache = dict()
 
         # Extra bytes to read to ensure correct decoding of
-        # RETN and RETN imm16 instructions.
-        self.dbg_read_extra = 3
+        # RETN, RETN imm16, CALL /2, and JMP /4 instructions.
+        self.dbg_read_extra = 6 # FF + ModR/M + SIB + disp32 
 
         self.insn_arithmetic_ops = ["inc","dec","neg", "add","sub","mul","imul","div","idiv","adc","sbb","lea"]
         self.insn_bit_ops = ["not","and","or","xor","shr","shl","sar","sal","shld","shrd","ror","rcr","rcl"]
@@ -942,12 +957,15 @@ class Rop():
             for n in xrange(idaapi.get_segm_qty()):
                 seg = idaapi.getnseg(n)
 
-                # Segment in a selected modules
-                if seg and seg.startEA >= m.addr and seg.endEA <= (m.addr + m.size):
+                # Locate executable segments in a selected modules
+                # NOTE: Each module may have multiple executable segments
+                if seg and \
+                   seg.startEA >= m.addr and seg.endEA <= (m.addr + m.size) and \
+                   seg.perm & idaapi.SEGPERM_EXEC:
 
-                    # Locate executable segments
-                    # NOTE: Each module may have multiple executable segments
-                    if seg.perm & idaapi.SEGPERM_EXEC:
+                    #######################################################
+                    # Search for ROP gadgets
+                    if self.searchRop:
 
                         #Search all instances of RETN 
                         ea = seg.startEA
@@ -966,9 +984,82 @@ class Rop():
                             retn_imm16 = idaapi.dbg_read_memory ( ea + 1, 0x2)
                             retn_imm16 = unpack("<H", retn_imm16)[0]
 
-                            if retn_imm16 <= self.maxRetn:
+                            if retn_imm16 <= self.maxRetnImm:
 
                                 self.retns.append( (ea, m.file))
+
+                    #######################################################
+                    # Search for JOP gadgets
+                    if self.searchJop:
+
+                        # Search all instances of JMP reg (FF /4) and CALL reg (FF /2)
+                        ea = seg.startEA
+                        while True:
+                            ea = idaapi.find_binary(ea + 1, seg.endEA, "FF", 16, idaapi.SEARCH_DOWN)
+                            if ea == idaapi.BADADDR: break
+
+                            # Read possible ModR/M, SIB, and IMM8/IMM32 bytes
+                            jop = idaapi.dbg_read_memory ( ea + 1, 0x6)
+
+                            ###################################################
+                            # JMP/CALL reg
+                            if jop[0] in ["\xe0","\xe1","\xe2","\xe3","\xe4","\xe5","\xe6","\xe7",
+                                          "\xd0","\xd1","\xd2","\xd3","\xd4","\xd5","\xd6","\xd7"]:
+                                self.retns.append( (ea, m.file))
+
+                            ###################################################
+                            # JMP/CALL [reg] no SIB
+                            # NOTE: Do not include pure [disp] instruction.
+
+                            # JMP/CALL [reg] no *SP,*BP
+                            elif jop[0] in ["\x20","\x21","\x22","\x23","\x26","\x27", 
+                                            "\x10","\x11","\x12","\x13","\x16","\x17"]:
+                                self.retns.append( (ea, m.file))
+
+                            # JMP/CALL [reg + imm8] no *SP
+                            elif jop[0] in ["\x60","\x61","\x62","\x63","\x65","\x66","\x67",
+                                            "\x50","\x51","\x52","\x53","\x55","\x56","\x57"]:
+                                jop_imm8 = jop[1]
+                                jop_imm8 = unpack("b", jop_imm8)[0] # signed
+
+                                if jop_imm8 <= self.maxJopImm:
+                                    self.retns.append( (ea, m.file))
+
+
+                            # JMP/CALL [reg + imm32] no *SP
+                            elif jop[0] in ["\xa0","\xa1","\xa2","\xa3","\xa5","\xa6","\xa7",
+                                            "\x90","\x91","\x92","\x93","\x95","\x96","\x97"]:
+                                jop_imm32 = jop[1:5]
+                                jop_imm32 = unpack("<i", jop_imm32)[0] # signed
+
+                                if jop_imm32 <= self.maxJopImm:
+                                    self.retns.append( (ea, m.file))
+
+                            ###################################################
+                            # JMP/CALL [reg] with SIB
+                            # NOTE: Do no include pure [disp] instructions in SIB ([*] - none)
+                            elif (jop[0] in ["\x24","\x64","\xa4"] and not jop[1] in ["\x25","\x65","\xad","\xe5"]) or \
+                                 (jop[0] in ["\x14","\x54","\x94"] and not jop[1] in ["\x25","\x65","\xad","\xe5"]):
+
+                                 # Check for displacement
+                                if jop[0] in ["\x64","\x54"]:
+                                    jop_imm8 = jop[2]
+                                    jop_imm8 = unpack("b", jop_imm8)[0] # signed
+
+                                    if jop_imm8 <= self.maxJopImm:
+                                        self.retns.append( (ea, m.file))
+
+                                elif jop[0] in ["\xa4","\x94"]:
+                                    jop_imm32 = jop[2:6]
+                                    jop_imm32 = unpack("<i", jop_imm32)[0] # signed
+
+                                    if jop_imm32 <= self.maxJopImm:
+                                        self.retns.append( (ea, m.file))
+
+                                else:
+                                    self.retns.append( (ea, m.file))
+
+        print "[idasploiter] Found %d returns" % len(self.retns)
 
     def search_gadgets(self):
 
@@ -982,9 +1073,9 @@ class Rop():
         breakFlag = False
 
         # Show wait dialog
-        idaapi.show_wait_box("Searching ROP gadgets: 00%%%%")
+        if not self.debug: idaapi.show_wait_box("Searching gadgets: 00%%%%")
 
-        for (retn, module) in self.retns:
+        for (ea_end, module) in self.retns:
 
             # Flush the gadgets cache for each new retn pointer
             self.gadgets_cache = dict()
@@ -996,19 +1087,19 @@ class Rop():
             #        Try to read and cache self.maxRopOffset bytes back. In cases where it is not possible,
             #        then simply try to read the largest chunk.
             
-            # NOTE: Read a bit extra to cover correct decoding of RETN and RETN imm16 instructions.
+            # NOTE: Read a bit extra to cover correct decoding of RETN, RETN imm16, CALL /2, and JMP /4 instructions.
 
             for i in range(self.maxRopOffset):
-                self.dbg_mem_cache = idaapi.dbg_read_memory(retn - self.maxRopOffset + i, self.maxRopOffset - i + self.dbg_read_extra)
+                self.dbg_mem_cache = idaapi.dbg_read_memory(ea_end - self.maxRopOffset + i, self.maxRopOffset - i + self.dbg_read_extra)
                 if self.dbg_mem_cache != None:
                     break
 
             # Search all possible gadgets up to maxoffset bytes back
-            # NOTE: try all byte combinations to capture longer/more instructions
+            # NOTE: Try all byte combinations to capture longer/more instructions
             #       even with bad bytes in the middle.
             for i in range(1, len(self.dbg_mem_cache) - self.dbg_read_extra):
 
-                ea = retn - i
+                ea = ea_end - i
 
                 # Get pointer charset
                 ptr_charset = self.sploiter.get_ptr_charset(ea)
@@ -1024,7 +1115,7 @@ class Rop():
                 if self.ptrAlpha      and not "alpha"      in ptr_charset: continue
 
                 # Try to build a gadget at the pointer
-                gadget = self.build_gadget(ea, retn)
+                gadget = self.build_gadget(ea, ea_end)
 
                 # Successfully built the gadget
                 if gadget:
@@ -1062,22 +1153,22 @@ class Rop():
                 break
 
             # Progress report
-            if count_curr >= count_notify:
+            if not self.debug and count_curr >= count_notify:
 
                 # NOTE: Need to use %%%% to escape both Python and IDA's format strings
-                idaapi.replace_wait_box("Searching ROP gadgets: %02d%%%%" % (count_curr*100/count_total) ) 
+                idaapi.replace_wait_box("Searching gadgets: %02d%%%%" % (count_curr*100/count_total) ) 
 
                 count_notify += 0.10 * count_total
 
             count_curr += 1            
 
-        print "[idasploiter] Found %d ROP gadgets." % len(self.gadgets)
-        idaapi.hide_wait_box()
+        print "[idasploiter] Found %d gadgets." % len(self.gadgets)
+        if not self.debug: idaapi.hide_wait_box()
 
 
     # Attempt to build a gadget at the provided start address
     # by verifying it properly terminates at the expected RETN.
-    def build_gadget(self, ea, retn):
+    def build_gadget(self, ea, ea_end):
 
         instructions  = list()
         chg_registers = set()
@@ -1086,7 +1177,7 @@ class Rop():
         pivot         = 0
 
         # Process each instruction in the gadget
-        while ea <= retn:
+        while ea <= ea_end:
 
             ###################################################################
             # Gadget Level Cache:
@@ -1136,7 +1227,7 @@ class Rop():
                 if insn_size:
 
                     # Decoded instruction is too big to be a RETN or RETN imm16
-                    if ea + insn_size > retn + self.dbg_read_extra:
+                    if ea + insn_size > ea_end + self.dbg_read_extra:
                         return None
 
                     ###############################################################
@@ -1145,12 +1236,9 @@ class Rop():
                     # Most instructions are repetitive so we can just cache
                     # unique byte combinations to avoid costly decoding more
                     # than once
-
-                    # Read instruction from memory
-                    #dbg_mem = idaapi.dbg_read_memory( ea, insn_size)
                     
                     # Read instruction from memory cache
-                    dbg_mem_offset = ea - (retn - (len(self.dbg_mem_cache) - self.dbg_read_extra) )
+                    dbg_mem_offset = ea - (ea_end - (len(self.dbg_mem_cache) - self.dbg_read_extra) )
                     dbg_mem = self.dbg_mem_cache[dbg_mem_offset:dbg_mem_offset + insn_size]
 
                     # Create instruction cache if it doesn't already exist
@@ -1166,7 +1254,7 @@ class Rop():
 
                         #######################################################
                         # Decode and Cache instruction characteristics
-                        self.insn_cache[dbg_mem] = self.decode_instruction(insn, ea)
+                        self.insn_cache[dbg_mem] = self.decode_instruction(insn, ea, ea_end)
 
                     ##################################################################
                     # Retrieve cached instruction and apply it to the gadget    
@@ -1179,18 +1267,25 @@ class Rop():
                         insn_disas = self.insn_cache[dbg_mem]["insn_disas"]
                         instructions.append(insn_disas)
 
-                        # Check if we found a RETN instruction
-                        if insn_mnem == "retn":
+                        #######################################################
+                        # Expected ending instruction of the gadget
+                        if ea == ea_end:
+                            gadget = Gadget(instructions, pivot, operations, chg_registers, use_registers)
+                            return gadget
 
-                            # RETN at the expected address
-                            if ea == retn:
-                                gadget = Gadget(instructions, pivot, operations, chg_registers, use_registers)
-                                return gadget
+                        #######################################################
+                        # Filter out of place ROP/JOP/COP terminators
+                        # NOTE: retn/jmp/call are allowed, but only in the last position
 
-                            # RETN at an unexpected address
-                            else:
-                                return None
+                        # Unexpected return instruction
+                        elif insn_mnem == "retn":
+                            return None
 
+                        # Unexpected call/jmp instruction
+                        elif insn_mnem in ["jmp","call"]:
+                            return None
+
+                        #######################################################
                         # Add instruction instruction characteristics to the gadget
                         else:
 
@@ -1204,7 +1299,6 @@ class Rop():
                                 operations.add(op)
 
                             pivot += self.insn_cache[dbg_mem]["insn_pivot"]
-
 
                     # Previous attempt to decode the instruction invalidated the gadget
                     else:                        
@@ -1227,11 +1321,8 @@ class Rop():
                     #       Since this option is normally disabled, I will attempt
                     #       to get this instruction manually.
 
-                    # Read two bytes from memory at current instruction candidate
-                    #dbg_mem = idaapi.dbg_read_memory( ea, 0x2)
-
                     # Read two bytes from memory cache at current instruction candidate
-                    dbg_mem_offset = ea - (retn - self.maxRopOffset)
+                    dbg_mem_offset = ea - (ea_end - self.maxRopOffset)
                     dbg_mem = self.dbg_mem_cache[dbg_mem_offset:dbg_mem_offset + 2]
 
                     # Compare to two zero bytes
@@ -1248,7 +1339,7 @@ class Rop():
                         ea += 2
 
                     # "MOV Sreg, r/m16" instructions will result in illegal instruction exception: c000001d
-                    # or the memory couldn't be read exception: c0000005 which we don't want in our ROP gadgets.
+                    # or the memory couldn't be read exception: c0000005 which we don't want in our gadgets.
                     elif dbg_mem[0] == "\x8E":
                         return None
 
@@ -1271,7 +1362,7 @@ class Rop():
     ###############################################################
     # Decode instruction
 
-    def decode_instruction(self, insn, ea):
+    def decode_instruction(self, insn, ea, ea_end):
 
         # Instruction specific characteristics
         insn_chg_registers = set()
@@ -1327,22 +1418,23 @@ class Rop():
         # Filter gadget
         ###############################################################
 
-        # Filter gadgets with instructions that don't forward execution to the next address
-        if insn_feature & idaapi.CF_STOP and insn_mnem != "retn":
-            return None
+        # Do not filter ROP, JOP, COP, always decode them
+        # NOTE: A separate check must be done to check if they are out of place.
+        if not insn_mnem in ["retn","jmp","call"]:
 
-        # Filter gadgets with instructions in a bad list
-        elif insn_mnem in self.ropBadMnems:
-            return None
+            # Filter gadgets with instructions that don't forward execution to the next address
+            if insn_feature & idaapi.CF_STOP:
+                return None
 
-        # Filter gadgets with jump instructions
-        # Note: conditional jumps may still be useful if we can
-        #       set flags prior to calling them.
-        elif not self.ropAllowJcc and insn_mnem[0] == "j":
-            return None
+            # Filter gadgets with instructions in a bad list
+            elif insn_mnem in self.ropBadMnems:
+                return None
 
-        elif insn_mnem == "jmp":
-            return None
+            # Filter gadgets with jump instructions
+            # Note: conditional jumps may still be useful if we can
+            #       set flags prior to calling them.
+            elif not self.ropAllowJcc and insn_mnem[0] == "j":
+                return None
 
         ###############################################################
         # Get disassembly
@@ -1408,6 +1500,7 @@ class Rop():
                 insn_operations.add("one-imm")
 
             # Single operand reference
+            # TODO: determine the [reg + ...] value if present
             elif insn_op1 == idaapi.o_phrase or insn_op1 == idaapi.o_displ:
                 insn_operations.add("one-mem")
 
@@ -1470,6 +1563,8 @@ class Rop():
                         insn_operations.add("reg-to-reg")
                     elif insn_op2 == idaapi.o_imm:
                         insn_operations.add("imm-to-reg")
+
+                    # TODO: determine the [reg + ...] value if present
                     elif insn_op2 == idaapi.o_phrase or insn_op2 == idaapi.o_displ:
                         insn_operations.add("mem-to-reg")
 
@@ -1493,6 +1588,7 @@ class Rop():
                     insn_use_registers.add(reg_name)
 
                 # Check for operations
+                # TODO: determine the [reg + ...] value if present
                 if insn_op1 == idaapi.o_phrase or insn_op1 == idaapi.o_displ:
                     insn_operations.add("reg-to-mem")
 
@@ -1514,10 +1610,7 @@ class Sploiter():
 
     def __init__(self):
         
-        self.maxOffset = 40  # Maximum offset from the return instruction to look for gadgets. default: 40
-        self.maxRopSize = 6  # Maximum number of instructions to look for gadgets. default: 6
-        self.maxRetn = 40    # Maximum imm16 value in retn. default: 40
-        self.maxRops = 0     # Maximum number of ROP chains to find. default: 0 (unlimited)
+
 
         # Process modules list
         self.modules = list()
@@ -1647,13 +1740,13 @@ class Sploiter():
 
     def process_rop(self, select_list = None):
 
+        # Initialize ROP gadget search engine
+        self.rop = Rop(self)
+
         # Prompt user for ROP search settings
         f = RopForm(self, select_list)
         ok = f.Execute()
         if ok == 1:
-
-            # Initialize ROP gadget search engine
-            self.rop = Rop(self)
 
             # Configure ROP gadget search engine
 
@@ -1696,7 +1789,11 @@ class Sploiter():
                 self.rop.maxRopSize    = f.intMaxRopSize.value
                 self.rop.maxRopOffset  = f.intMaxRopOffset.value
                 self.rop.maxRops       = f.intMaxRops.value
-                self.rop.maxRetn       = f.intMaxRetn.value
+                self.rop.maxRetnImm    = f.intMaxRetnImm.value
+
+                # Gadget search values
+                self.rop.searchRop     = f.cRopSearch.checked
+                self.rop.searchJop     = f.cJopSearch.checked
 
                 # Search for returns and ROP gadgets
                 self.rop.search_retns()
@@ -1859,7 +1956,7 @@ class ModuleView(Choose2):
         # Add extra context menu commands
         # NOTE: Make sure you check for duplicates
         if self.cmd_search_gadgets == None:
-            self.cmd_search_gadgets = self.AddCommand("Search ROP gadgets...", flags = idaapi.CHOOSER_POPUP_MENU | idaapi.CHOOSER_MULTI_SELECTION, icon=182 )
+            self.cmd_search_gadgets = self.AddCommand("Search gadgets...", flags = idaapi.CHOOSER_POPUP_MENU | idaapi.CHOOSER_MULTI_SELECTION, icon=182 )
         if self.cmd_search_pointers == None:
             self.cmd_search_pointers = self.AddCommand("Search function pointers...", flags = idaapi.CHOOSER_POPUP_MENU | idaapi.CHOOSER_MULTI_SELECTION, icon=143 )
 
@@ -1967,7 +2064,7 @@ class ModuleView(Choose2):
 ###############################################################################
 
 ###############################################################################
-# ROP Form
+# ROP/JOP/COP Form
 
 class RopForm(Form):
 
@@ -1985,28 +2082,32 @@ Search ROP gadgets
 {FormChangeCb}<Modules:{cEChooser}>
 
 Pointer Charset:                  Search Settings:
-<nonull:{cPtrNonull}>        <Bad Chars       :{strBadChars}>     
-<unicode:{cPtrUnicode}>       Unicode Table   <ANSI:{rUnicodeANSI}><OEM:{rUnicodeOEM}><UTF7:{rUnicodeUTF7}><UTF8:{rUnicodeUTF8}>{radUnicode}>
-<ascii:{cPtrAscii}>         <Bad Instructions:{strBadMnems}>
-<asciiprint:{cPtrAsciiPrint}>    <Max ROP size    :{intMaxRopSize}>
-<alphanum:{cPtrAlphaNum}>      <Max ROP offset  :{intMaxRopOffset}>
-<alpha:{cPtrAlpha}>         <Max RETN imm16  :{intMaxRetn}>
-<numeric:{cPtrNum}>{ptrGroup}>       <Max ROP gadgets :{intMaxRops}>
-                Other settings  <Allow conditional jumps:{cRopAllowJcc}>
-                <Do not allow bad bytes:{cRopNoBadBytes}>{ropGroup}>
+<nonull:{cPtrNonull}>        <Bad Chars        :{strBadChars}>     
+<unicode:{cPtrUnicode}>       Unicode Table    <ANSI:{rUnicodeANSI}><OEM:{rUnicodeOEM}><UTF7:{rUnicodeUTF7}><UTF8:{rUnicodeUTF8}>{radUnicode}>
+<ascii:{cPtrAscii}>         <Bad Instructions :{strBadMnems}>
+<asciiprint:{cPtrAsciiPrint}>    <Max gadget size  :{intMaxRopSize}>
+<alphanum:{cPtrAlphaNum}>      <Max gadget offset:{intMaxRopOffset}>
+<alpha:{cPtrAlpha}>         <Max RETN imm16   :{intMaxRetnImm}>
+<numeric:{cPtrNum}>{ptrGroup}>       <Max JOP imm8/32  :{intMaxJopImm}>
+                <Max gadgets      :{intMaxRops}>
+                Other settings   <Allow conditional jumps:{cRopAllowJcc}>
+                <Do not allow bad bytes:{cRopNoBadBytes}>
+                <Search for ROP gadgets:{cRopSearch}>
+                <Search for JOP gadgets:{cJopSearch}>{ropGroup}>
 
 
 """, {
                 'cEChooser'       : Form.EmbeddedChooserControl(self.mod, swidth=131),
                 'ptrGroup'        : Form.ChkGroupControl(("cPtrNonull", "cPtrAscii", "cPtrAsciiPrint", "cPtrUnicode",'cPtrAlphaNum','cPtrAlpha','cPtrNum')),
-                'ropGroup'        : Form.ChkGroupControl(('cRopAllowJcc','cRopNoBadBytes')),
-                'intMaxRopSize'   : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=6),
-                'intMaxRopOffset' : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=40),
-                'intMaxRops'      : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=0),
-                'intMaxRetn'      : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=40),
+                'ropGroup'        : Form.ChkGroupControl(('cRopAllowJcc','cRopNoBadBytes','cRopSearch','cJopSearch')),
+                'intMaxRopSize'   : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=self.sploiter.rop.maxRopSize),
+                'intMaxRopOffset' : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=self.sploiter.rop.maxRopOffset),
+                'intMaxRops'      : Form.NumericInput(swidth=4,tp=Form.FT_DEC,value=self.sploiter.rop.maxRops),
+                'intMaxRetnImm'   : Form.NumericInput(swidth=4,tp=Form.FT_HEX,value=self.sploiter.rop.maxRetnImm),
+                'intMaxJopImm'    : Form.NumericInput(swidth=4,tp=Form.FT_HEX,value=self.sploiter.rop.maxJopImm),
                 'strBadChars'     : Form.StringInput(swidth=70,tp=Form.FT_ASCII),
                 'radUnicode'      : Form.RadGroupControl(("rUnicodeANSI","rUnicodeOEM","rUnicodeUTF7","rUnicodeUTF8")),
-                'strBadMnems'     : Form.StringInput(swidth=70,tp=Form.FT_ASCII,value="leave, call, int, into, enter, syscall, sysenter, sysexit, sysret, in, out, loop, loope, loopne, lock, rep, repe, repz, repne, repnz"),
+                'strBadMnems'     : Form.StringInput(swidth=80,tp=Form.FT_ASCII,value="leave, int, into, enter, syscall, sysenter, sysexit, sysret, in, out, loop, loope, loopne, lock, rep, repe, repz, repne, repnz"),
                 'FormChangeCb'    : Form.FormChangeCb(self.OnFormChange),
             })
 
@@ -2027,6 +2128,13 @@ Pointer Charset:                  Search Settings:
                         self.select_list.append(i)
 
             self.SetControlValue(self.cEChooser, self.select_list)
+
+            # Enable both ROP and JOP search by default
+            self.SetControlValue(self.cRopSearch, True)
+            self.SetControlValue(self.cJopSearch, True)
+
+            # Skip bad instructions by default
+            self.SetControlValue(self.cRopNoBadBytes, True)
 
         # Form OK pressed
         elif fid == -2:
@@ -3335,7 +3443,7 @@ class SploitManager():
         if self.add_menu_item_helper("View/Open subviews/Segments", "Modules", "Shift+F6", 0, self.show_modules_view, None): return 1
 
         if self.add_menu_item_helper("Search/all error operands", "function pointers...", "Alt+f", 1, self.show_funcptr_view, None): return 1
-        if self.add_menu_item_helper("Search/all error operands", "ROP gadgets...", "Alt+r", 1, self.show_rop_view, None): return 1
+        if self.add_menu_item_helper("Search/all error operands", "gadgets...", "Alt+r", 1, self.show_rop_view, None): return 1
 
         if self.add_menu_item_helper("Edit/Begin selection", "Create pattern...", "Shift+c", 0, self.show_pattern_create, None): return 1
         if self.add_menu_item_helper("Edit/Begin selection", "Detect pattern...", "Shift+d", 0, self.show_pattern_detect, None): return 1
@@ -3470,10 +3578,6 @@ def idasploiter_main():
     idasploiter_manager.add_menu_items()
 
     sploiter = idasploiter_manager.sploiter
-
-    #sploiter.process_modules()
-    #mod = ModuleView(sploiter)
-    #mod.show()
 
 if __name__ == '__main__':
     #idasploiter_main()
