@@ -530,18 +530,26 @@ class PE():
 
             if self.load_config_directory and self.load_config_directory.SecurityCookie != 0:
 
-                # Confirm the Security Cookie is not zero
-                if self.arch64:
-                    cookie = idaapi.dbg_read_memory(self.load_config_directory.SecurityCookie, 8)
-                    cookie = struct.unpack("<Q", cookie)[0]
-                else:
-                    cookie = idaapi.dbg_read_memory(self.load_config_directory.SecurityCookie, 4)
-                    cookie = struct.unpack("<I", cookie)[0]
+                # Attempt to read the security cookie
+                # NOTE: The extra exception handler was added to account for cookie being stored in memory locations
+                #       that are not accessible by the debugger (e.g. manually loading win32k.sys, security cookie
+                #       address will point to kernel space which we can't read)
+                try:
+                    # Confirm the Security Cookie is not zero
+                    if self.arch64:
+                        cookie = idaapi.dbg_read_memory(self.load_config_directory.SecurityCookie, 8)
+                        cookie = struct.unpack("<Q", cookie)[0]
+                    else:
+                        cookie = idaapi.dbg_read_memory(self.load_config_directory.SecurityCookie, 4)
+                        cookie = struct.unpack("<I", cookie)[0]
 
-                if cookie != 0:
-                    return "Yes"
-                else:
-                    return "Null"
+                    if cookie != 0:
+                        return "Yes"
+                    else:
+                        return "Null"
+
+                except Exception, e:
+                    return "Inv"
 
             else:
                 return "No"
@@ -1946,6 +1954,7 @@ class ModuleView(Choose2):
         self.select_list = list()
 
         # Command callbacks
+        self.cmd_load_module     = None
         self.cmd_search_gadgets  = None
         self.cmd_search_pointers = None
 
@@ -1955,10 +1964,13 @@ class ModuleView(Choose2):
 
         # Add extra context menu commands
         # NOTE: Make sure you check for duplicates
+        if self.cmd_load_module == None:
+            self.cmd_load_module = self.AddCommand("Load module...", flags = idaapi.CHOOSER_POPUP_MENU, icon=135)
         if self.cmd_search_gadgets == None:
             self.cmd_search_gadgets = self.AddCommand("Search gadgets...", flags = idaapi.CHOOSER_POPUP_MENU | idaapi.CHOOSER_MULTI_SELECTION, icon=182 )
         if self.cmd_search_pointers == None:
             self.cmd_search_pointers = self.AddCommand("Search function pointers...", flags = idaapi.CHOOSER_POPUP_MENU | idaapi.CHOOSER_MULTI_SELECTION, icon=143 )
+
 
         return True
 
@@ -2023,6 +2035,20 @@ class ModuleView(Choose2):
             # Selection number
             else:
                 self.select_list.append(n)
+
+        elif cmd_id == self.cmd_load_module:
+
+            module_name = idaapi.askfile_c(0, "*.*", "Please select module to load")
+            if module_name:
+                print "[idasploiter] Loading module: %s" % module_name     
+                loadlib = idaapi.Appcall.proto("kernel32_LoadLibraryA", "int __stdcall loadlib(const char *fn);")
+                hmod = loadlib(module_name)
+                if hmod:
+                    print "[idasploiter] Finished loading module: %s" % module_name
+                else:
+                    print "[idasploiter] Could not load: %s" % module_name
+
+                self.refreshitems()
 
         return 1
 
